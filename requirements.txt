@@ -10,4 +10,4 @@ pydantic-settings==2.5.2
 python-multipart==0.0.9
 python-dotenv==1.0.1
 sse-starlette==2.1.0
-asyncpg==0.29.0
+asyncpg==0.30.0
