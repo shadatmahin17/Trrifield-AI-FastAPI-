@@ -1,15 +1,8 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any
 
 
 # ── Search ────────────────────────────────────────────────────────────────
-class SearchRequest(BaseModel):
-    query:      str
-    discipline: Optional[str] = "all"
-    year_from:  Optional[int] = None
-    year_to:    Optional[int] = None
-    limit:      Optional[int] = 10
-
 class Author(BaseModel):
     name: str
 
@@ -30,7 +23,7 @@ class SearchResponse(BaseModel):
     interpreted_query:   Optional[str] = None
     intent:              Optional[str] = None
     detected_discipline: Optional[str] = None
-    rewrite_source:      Optional[str] = None   # "llm" | "rules"
+    rewrite_source:      Optional[str] = None
     total:               int
     discipline:          str
     papers:              list[Paper]
@@ -45,10 +38,17 @@ class ChatMessage(BaseModel):
     role:    str
     content: str
 
+# Structured citation source — page + bbox for click-to-highlight
+class CitationSource(BaseModel):
+    ref:     int              # citation number [1], [2] etc.
+    page:    int              # 1-based page number
+    bbox:    Optional[list[float]]  # [x0, y0, x1, y1] in PDF points
+    snippet: str              # first ~180 chars of the chunk
+
 class ChatResponse(BaseModel):
     session_id: str
     answer:     str
-    sources:    list[str]
+    sources:    list[CitationSource]   # structured, not raw strings
     history:    list[ChatMessage]
 
 
@@ -58,7 +58,7 @@ class PropertyRow(BaseModel):
     value:         str
     unit:          Optional[str]
     test_standard: Optional[str]
-    page_ref:      Optional[str]
+    page_ref:      Optional[Any]
 
 class PropertyExtractionResponse(BaseModel):
     session_id:  str
@@ -67,15 +67,15 @@ class PropertyExtractionResponse(BaseModel):
 
 # ── Citations ─────────────────────────────────────────────────────────────
 class CitationRequest(BaseModel):
-    paper_id: Optional[str] = None
-    title:    Optional[str] = None
+    paper_id: Optional[str]       = None
+    title:    Optional[str]       = None
     authors:  Optional[list[str]] = None
-    year:     Optional[int] = None
-    journal:  Optional[str] = None
-    volume:   Optional[str] = None
-    pages:    Optional[str] = None
-    doi:      Optional[str] = None
-    style:    str = "apa"
+    year:     Optional[int]       = None
+    journal:  Optional[str]       = None
+    volume:   Optional[str]       = None
+    pages:    Optional[str]       = None
+    doi:      Optional[str]       = None
+    style:    str                 = "apa"
 
 class CitationResponse(BaseModel):
     style:    str
