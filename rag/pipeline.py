@@ -191,13 +191,22 @@ def find_best_sentence(
 ) -> dict | None:
     """
     Given a claim from the LLM answer and a retrieved chunk,
-    find the sentence in that chunk with highest text overlap to the claim.
+    find the sentence in that chunk whose BEGINNING best matches
+    the start of the claim.
 
-    Returns the sentence dict {text, page, bbox, ...} or None.
+    Key fix: we compare the first N words of the claim against the
+    first N words of each sentence — not the full text.
+    This ensures the highlight lands on the START of the passage,
+    not somewhere in the middle where overlapping words happen to cluster.
     """
     norm_claim = _normalise(claim)
     if not norm_claim:
         return None
+
+    # Use only the first 12 words of the claim as the match target
+    # These most reliably correspond to the opening line of the source passage
+    claim_words = norm_claim.split()
+    match_head  = claim_words[:12]
 
     best_score = 0.0
     best_sent  = None
@@ -209,21 +218,26 @@ def find_best_sentence(
     for si in indices:
         if si >= len(all_sentences):
             continue
-        sent       = all_sentences[si]
-        norm_sent  = _normalise(sent["text"])
-        score      = _word_overlap_score(norm_claim, norm_sent)
+        sent      = all_sentences[si]
+        norm_sent = _normalise(sent["text"])
+        sent_words = norm_sent.split()
 
-        # Boost: if claim starts with words from this sentence
-        claim_words = norm_claim.split()[:6]
-        sent_words  = norm_sent.split()
-        if any(w in sent_words for w in claim_words):
-            score += 0.15
+        # Compare claim head against sentence head (first 12 words)
+        sent_head   = sent_words[:12]
+        head_overlap = len(set(match_head) & set(sent_head))
+
+        # Also score full overlap as a secondary signal
+        full_overlap = len(set(claim_words) & set(sent_words))
+
+        # Weighted: head match is 3x more important than full overlap
+        score = (head_overlap * 3) + full_overlap
 
         if score > best_score:
             best_score = score
             best_sent  = sent
 
-    return best_sent if best_score > 0.10 else None
+    # Minimum threshold: at least 2 head words must match
+    return best_sent if best_score >= 6 else None
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────
