@@ -41,9 +41,10 @@ class ChatMessage(BaseModel):
 class CitationSource(BaseModel):
     ref:         int
     page:        int
-    page_height: Optional[float] = None   # PDF page height in points
-    page_width:  Optional[float] = None   # PDF page width in points
-    bbox:        Optional[list[float]] = None  # [x0,y0,x1,y1] top-left origin
+    page_height: Optional[float] = None        # PDF page height in points
+    page_width:  Optional[float] = None        # PDF page width in points
+    bbox:        Optional[list[float]] = None  # first-line bbox [x0,y0,x1,y1] — fallback
+    bboxes:      Optional[list[list[float]]] = None  # Phase 5: ALL line bboxes for multi-highlight
     snippet:     str
 
 class ChatResponse(BaseModel):
