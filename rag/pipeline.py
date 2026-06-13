@@ -1,14 +1,11 @@
 """
 RAG pipeline — position-aware ingestion + clean citation answers.
 
-Ingest:  pymupdf extracts text block-by-block, preserving page_number + bbox.
-         Each chunk stored in Qdrant with {text, page, bbox, chunk_index}.
-
-Chat:    Retrieved chunks numbered [1]..[N].
-         Prompt instructs Claude to cite inline as [1], [2] etc.
-         Response includes structured sources with page + snippet for frontend.
+pymupdf block coordinates are TOP-LEFT origin (y increases downward),
+same as HTML canvas. No coordinate flip needed on the frontend.
+We also store page_height so the frontend can scale bbox correctly.
 """
-import uuid, re, logging
+import uuid, logging
 from vectorstore.qdrant_store import get_store
 from core.llm import llm_call
 from core.config import get_settings
@@ -24,49 +21,51 @@ _chat_history_mem: dict[str, list[ChatMessage]] = {}
 
 def _extract_blocks(doc) -> list[dict]:
     """
-    Extract text blocks from pymupdf with page number and bounding box.
-    Returns list of {text, page, bbox: [x0,y0,x1,y1]}.
+    Extract text blocks from pymupdf preserving page, bbox, and page_height.
+
+    pymupdf coordinate system: TOP-LEFT origin, y increases downward.
+    bbox = [x0, y0, x1, y1] in PDF points (1 point = 1/72 inch).
+    page_height stored so frontend can scale to canvas pixels.
     """
     blocks = []
     for page_num, page in enumerate(doc, start=1):
+        page_rect   = page.rect
+        page_height = round(page_rect.height, 1)
+        page_width  = round(page_rect.width,  1)
+
         for block in page.get_text("blocks"):
-            # block = (x0, y0, x1, y1, text, block_no, block_type)
             x0, y0, x1, y1, text, *_ = block
             text = text.strip()
             if text and len(text.split()) > 5:
                 blocks.append({
-                    "text": text,
-                    "page": page_num,
-                    "bbox": [round(x0,1), round(y0,1), round(x1,1), round(y1,1)],
+                    "text":        text,
+                    "page":        page_num,
+                    "page_height": page_height,
+                    "page_width":  page_width,
+                    "bbox":        [round(x0,1), round(y0,1), round(x1,1), round(y1,1)],
                 })
     return blocks
 
 
 def _merge_blocks_into_chunks(
-    blocks: list[dict],
-    chunk_words: int = 350,
-    overlap_words: int = 60,
+    blocks:       list[dict],
+    chunk_words:  int = 350,
+    overlap_words:int = 60,
 ) -> list[dict]:
     """
-    Merge small blocks into chunks of ~chunk_words words.
-    Each chunk carries: text, page (of first block), bbox (union of blocks).
-    Overlapping chunks share overlap_words from the previous chunk for context.
+    Merge blocks into ~chunk_words chunks.
+    Each chunk keeps page, page_height, page_width, and union bbox.
     """
     chunks   = []
     buf_text = []
-    buf_page = None
-    buf_bbox = None
+    buf_meta = {}   # page, page_height, page_width, bbox
 
     def flush():
-        nonlocal buf_text, buf_page, buf_bbox
-        if not buf_text:
+        if not buf_text or not buf_meta:
             return
         text = " ".join(buf_text)
         if len(text.split()) > 15:
-            chunks.append({"text": text, "page": buf_page, "bbox": buf_bbox})
-        buf_text = []
-        buf_page = None
-        buf_bbox = None
+            chunks.append({**buf_meta, "text": text})
 
     def union_bbox(a, b):
         if a is None: return b
@@ -74,21 +73,27 @@ def _merge_blocks_into_chunks(
         return [min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3])]
 
     for blk in blocks:
-        words = blk["text"].split()
-        if buf_page is None:
-            buf_page = blk["page"]
-            buf_bbox = blk["bbox"]
+        if not buf_meta:
+            buf_meta = {
+                "page":        blk["page"],
+                "page_height": blk["page_height"],
+                "page_width":  blk["page_width"],
+                "bbox":        blk["bbox"],
+            }
 
-        buf_text.extend(words)
-        buf_bbox = union_bbox(buf_bbox, blk["bbox"])
+        buf_text.extend(blk["text"].split())
+        buf_meta["bbox"] = union_bbox(buf_meta["bbox"], blk["bbox"])
 
         if len(buf_text) >= chunk_words:
             flush()
-            # Overlap: carry last overlap_words into next chunk
-            prev_words = " ".join(buf_text[-overlap_words:]) if buf_text else ""
-            buf_text   = prev_words.split() if prev_words else []
-            buf_page   = blk["page"]
-            buf_bbox   = blk["bbox"]
+            overlap = buf_text[-overlap_words:]
+            buf_text = list(overlap)
+            buf_meta = {
+                "page":        blk["page"],
+                "page_height": blk["page_height"],
+                "page_width":  blk["page_width"],
+                "bbox":        blk["bbox"],
+            }
 
     flush()
     return chunks
@@ -125,14 +130,13 @@ async def _session_exists(session_id: str) -> bool:
 async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0) -> str:
     import pymupdf
 
-    session_id = str(uuid.uuid4())
-    doc        = pymupdf.open(stream=file_bytes, filetype="pdf")
+    session_id  = str(uuid.uuid4())
+    doc         = pymupdf.open(stream=file_bytes, filetype="pdf")
     total_pages = len(doc)
 
     if total_pages == 0:
         raise ValueError("PDF has no pages.")
 
-    # Position-aware extraction
     blocks = _extract_blocks(doc)
     doc.close()
 
@@ -162,50 +166,50 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
             logger.warning(f"DB session persist failed (non-fatal): {e}")
 
     _chat_history_mem[session_id] = []
-    logger.info(f"PDF ingested: {filename} → {n} chunks across {total_pages} pages")
+    logger.info(f"PDF ingested: {filename} → {n} chunks, {total_pages} pages, session={session_id}")
     return session_id
 
 
-# ── Chat ───────────────────────────────────────────────────────────────────
+# ── Context builder ────────────────────────────────────────────────────────
 
 def _build_context_and_sources(results: list[dict]) -> tuple[str, list[dict]]:
     """
-    Build numbered context block for the prompt + structured sources for the frontend.
+    Build numbered context for prompt + structured sources for frontend.
 
     Context sent to LLM:
         [1] (page 3)
-        "...chunk text..."
+        "chunk text..."
 
-        [2] (page 5)
-        "...chunk text..."
-
-    Sources returned to frontend:
-        [
-          { "ref": 1, "page": 3, "bbox": [...], "snippet": "first 180 chars…" },
-          ...
-        ]
+    Sources for frontend (ALL retrieved — frontend filters to cited only):
+        { ref, page, page_height, page_width, bbox, snippet }
     """
     context_parts = []
     sources       = []
 
     for i, r in enumerate(results, start=1):
-        page    = r.get("page", 1)
-        text    = r.get("text", "")
-        bbox    = r.get("bbox")
-        snippet = text[:180].strip()
-        if len(text) > 180:
+        page        = r.get("page", 1)
+        page_height = r.get("page_height")
+        page_width  = r.get("page_width")
+        text        = r.get("text", "")
+        bbox        = r.get("bbox")
+        snippet     = text[:200].strip()
+        if len(text) > 200:
             snippet += "…"
 
-        context_parts.append(f"[{i}] (page {page})\n\"{text}\"")
+        context_parts.append(f'[{i}] (page {page})\n"{text}"')
         sources.append({
-            "ref":     i,
-            "page":    page,
-            "bbox":    bbox,
-            "snippet": snippet,
+            "ref":         i,
+            "page":        page,
+            "page_height": page_height,
+            "page_width":  page_width,
+            "bbox":        bbox,
+            "snippet":     snippet,
         })
 
     return "\n\n".join(context_parts), sources
 
+
+# ── Chat ───────────────────────────────────────────────────────────────────
 
 async def chat_with_pdf(session_id: str, question: str) -> dict:
     if not await _session_exists(session_id):
@@ -247,7 +251,7 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
 
     return {
         "answer":  answer,
-        "sources": sources,   # structured list, not raw strings
+        "sources": sources,
         "history": [m.model_dump() for m in _chat_history_mem[session_id]],
     }
 
@@ -283,7 +287,7 @@ async def extract_properties(session_id: str) -> list[dict]:
         messages=[{"role": "user", "content": f"{PROPERTY_EXTRACT}\n\nTEXT:\n{context}"}],
         max_tokens=2048, prefer_json=True, task="property_extract",
     )
-    raw = raw.strip().replace("```json", "").replace("```", "").strip()
+    raw = raw.strip().replace("```json","").replace("```","").strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
