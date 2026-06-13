@@ -70,51 +70,57 @@ def _chunk_lines(
     """
     Merge lines into ~chunk_words chunks.
 
-    KEY FIX: we chunk at LINE level, so:
-    - buf_bbox is always the bbox of the FIRST LINE of the current chunk
-    - When overlap carries lines forward, the new chunk's bbox is the
-      bbox of the first overlap line — exactly where that chunk starts
+    HIGHLIGHT ANCHOR FIX:
+    When overlap carries lines from the previous chunk forward, those
+    overlap lines are NOT the semantic start of the new chunk — they're
+    carried-over context. The bbox must point to the FIRST NEW line
+    (i.e. the line after the overlap), not the first overlap line.
 
-    Issue 1 fix: bbox now matches the actual first line of the chunk text.
-    Issue 2 fix: bbox is a single line height (~12-16pt), not a block height.
+    We track this with `anchor_idx` — the index in buf_lines where
+    new (non-overlap) content starts.
     """
     chunks   = []
-    buf_text = []
-    buf_lines: list[dict] = []   # track lines in buffer for overlap
+    buf_lines: list[dict] = []
+    anchor_idx = 0   # index of first NEW line in buf_lines
 
     def flush():
-        if not buf_text or not buf_lines:
+        if not buf_lines:
             return
-        text = " ".join(buf_text)
-        if len(text.split()) > 15:
-            first = buf_lines[0]
-            chunks.append({
-                "text":        text,
-                "page":        first["page"],
-                "page_height": first["page_height"],
-                "page_width":  first["page_width"],
-                "bbox":        first["bbox"],   # exact first line of this chunk
-            })
+        text = " ".join(l["text"] for l in buf_lines)
+        if len(text.split()) < 15:
+            return
+        # Use the first NEW line (after overlap) as the highlight anchor
+        anchor = buf_lines[anchor_idx]
+        pw     = anchor.get("page_width") or 595.0
+        b      = anchor["bbox"]
+        # Extend x1 to cover full text width (two-column fix)
+        wide_bbox = [b[0], b[1], round(pw - 50, 1), b[3]]
+        chunks.append({
+            "text":        text,
+            "page":        anchor["page"],
+            "page_height": anchor["page_height"],
+            "page_width":  anchor["page_width"],
+            "bbox":        wide_bbox,
+        })
 
     for line in lines:
-        buf_text.extend(line["text"].split())
         buf_lines.append(line)
+        word_count = sum(len(l["text"].split()) for l in buf_lines)
 
-        if len(buf_text) >= chunk_words:
+        if word_count >= chunk_words:
             flush()
-            # Carry last overlap_lines into next chunk for context continuity
-            buf_lines = buf_lines[-overlap_lines:]
-            buf_text  = " ".join(l["text"] for l in buf_lines).split()
+            # Keep last overlap_lines as context for next chunk
+            overlap    = buf_lines[-overlap_lines:]
+            buf_lines  = list(overlap)
+            anchor_idx = 0   # all lines in new buffer are overlap initially
+            # The next NEW line added will update anchor_idx
+            # We set anchor_idx to len(overlap) so first new line becomes anchor
+            anchor_idx = len(overlap)
 
-    flush()
-
-    # Issue 2 fix: for two-column PDFs the first line only spans one column.
-    # Extend bbox x1 to page_width - margin so highlight covers full text area.
-    for chunk in chunks:
-        pw = chunk.get("page_width") or 595.0
-        b  = chunk["bbox"]
-        # Use a standard margin of ~50pt; extend x1 to right text boundary
-        chunk["bbox"] = [b[0], b[1], round(pw - 50, 1), b[3]]
+    # Flush remaining
+    if buf_lines:
+        anchor_idx = min(anchor_idx, len(buf_lines) - 1)
+        flush()
 
     return chunks
 
