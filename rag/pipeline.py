@@ -19,19 +19,20 @@ _chat_history_mem: dict[str, list[ChatMessage]] = {}
 
 # ── Position-aware chunking ────────────────────────────────────────────────
 
-def _extract_blocks(doc) -> list[dict]:
+def _extract_lines(doc) -> list[dict]:
     """
-    Extract text blocks from pymupdf with FIRST-LINE bbox as the highlight anchor.
+    Extract every text line from the PDF with its own bbox.
 
-    Using get_text("dict") gives us line-level bboxes. We store:
-      - full block text (for embedding quality)
-      - bbox of the FIRST LINE only (for tight highlight — not the whole paragraph)
-      - page, page_height, page_width
+    Working at LINE level (not block level) means:
+    - Each line has its own tight bbox
+    - When we chunk lines together, the first line of each chunk
+      has the exact bbox where that chunk's text actually starts
+    - No more "first line of block" vs "first line of chunk" mismatch
 
     pymupdf coordinate system: TOP-LEFT origin, y increases downward.
-    bbox = [x0, y0, x1, y1] in PDF points (1/72 inch each).
+    bbox = [x0, y0, x1, y1] in PDF points (1/72 inch).
     """
-    blocks = []
+    lines = []
     for page_num, page in enumerate(doc, start=1):
         page_rect   = page.rect
         page_height = round(page_rect.height, 1)
@@ -39,94 +40,82 @@ def _extract_blocks(doc) -> list[dict]:
 
         page_dict = page.get_text("dict")
         for block in page_dict.get("blocks", []):
-            # Skip image blocks (type=1), only text blocks (type=0)
-            if block.get("type") != 0:
+            if block.get("type") != 0:   # skip image blocks
                 continue
+            for line in block.get("lines", []):
+                # Join all spans in this line into one string
+                text = " ".join(
+                    span.get("text", "") for span in line.get("spans", [])
+                ).strip()
+                if not text or len(text) < 10:
+                    continue
 
-            lines = block.get("lines", [])
-            if not lines:
-                continue
-
-            # Full text of the block for embedding
-            full_text = " ".join(
-                " ".join(span.get("text", "") for span in line.get("spans", []))
-                for line in lines
-            ).strip()
-
-            if not full_text or len(full_text.split()) < 5:
-                continue
-
-            # Bbox of FIRST LINE only — gives a tight single-line highlight
-            first_line = lines[0]
-            fl = first_line.get("bbox", block["bbox"])
-            first_line_bbox = [
-                round(fl[0], 1), round(fl[1], 1),
-                round(fl[2], 1), round(fl[3], 1),
-            ]
-
-            blocks.append({
-                "text":        full_text,
-                "page":        page_num,
-                "page_height": page_height,
-                "page_width":  page_width,
-                "bbox":        first_line_bbox,
-            })
-    return blocks
+                lb = line.get("bbox", block["bbox"])
+                lines.append({
+                    "text":        text,
+                    "page":        page_num,
+                    "page_height": page_height,
+                    "page_width":  page_width,
+                    "bbox":        [round(lb[0],1), round(lb[1],1),
+                                    round(lb[2],1), round(lb[3],1)],
+                })
+    return lines
 
 
-def _merge_blocks_into_chunks(
-    blocks:        list[dict],
+def _chunk_lines(
+    lines:         list[dict],
     chunk_words:   int = 350,
-    overlap_words: int = 60,
+    overlap_lines: int = 4,
 ) -> list[dict]:
     """
-    Merge blocks into ~chunk_words chunks.
+    Merge lines into ~chunk_words chunks.
 
-    BUG FIX: previously used union_bbox across all blocks in a chunk,
-    which produced a bbox spanning the full page — making the highlight
-    cover the entire page yellow.
+    KEY FIX: we chunk at LINE level, so:
+    - buf_bbox is always the bbox of the FIRST LINE of the current chunk
+    - When overlap carries lines forward, the new chunk's bbox is the
+      bbox of the first overlap line — exactly where that chunk starts
 
-    Now we store the bbox of the FIRST block only as the anchor.
-    This gives a tight, accurate highlight at the start of the passage.
+    Issue 1 fix: bbox now matches the actual first line of the chunk text.
+    Issue 2 fix: bbox is a single line height (~12-16pt), not a block height.
     """
     chunks   = []
     buf_text = []
-    buf_meta = {}
+    buf_lines: list[dict] = []   # track lines in buffer for overlap
 
     def flush():
-        if not buf_text or not buf_meta:
+        if not buf_text or not buf_lines:
             return
         text = " ".join(buf_text)
         if len(text.split()) > 15:
-            chunks.append({**buf_meta, "text": text})
+            first = buf_lines[0]
+            chunks.append({
+                "text":        text,
+                "page":        first["page"],
+                "page_height": first["page_height"],
+                "page_width":  first["page_width"],
+                "bbox":        first["bbox"],   # exact first line of this chunk
+            })
 
-    for blk in blocks:
-        is_new_chunk = not buf_meta
-
-        if is_new_chunk:
-            # Anchor bbox = first block of this chunk only
-            buf_meta = {
-                "page":        blk["page"],
-                "page_height": blk["page_height"],
-                "page_width":  blk["page_width"],
-                "bbox":        blk["bbox"],   # first block — tight highlight
-            }
-
-        buf_text.extend(blk["text"].split())
+    for line in lines:
+        buf_text.extend(line["text"].split())
+        buf_lines.append(line)
 
         if len(buf_text) >= chunk_words:
             flush()
-            overlap  = buf_text[-overlap_words:]
-            buf_text = list(overlap)
-            # New chunk starts at current block
-            buf_meta = {
-                "page":        blk["page"],
-                "page_height": blk["page_height"],
-                "page_width":  blk["page_width"],
-                "bbox":        blk["bbox"],
-            }
+            # Carry last overlap_lines into next chunk for context continuity
+            buf_lines = buf_lines[-overlap_lines:]
+            buf_text  = " ".join(l["text"] for l in buf_lines).split()
 
     flush()
+
+    # Issue 2 fix: for two-column PDFs the first line only spans one column.
+    # Extend bbox x1 to page_width - margin so highlight covers full text area.
+    for chunk in chunks:
+        pw = chunk.get("page_width") or 595.0
+        b  = chunk["bbox"]
+        # Use a standard margin of ~50pt; extend x1 to right text boundary
+        chunk["bbox"] = [b[0], b[1], round(pw - 50, 1), b[3]]
+
     return chunks
 
 
@@ -168,13 +157,13 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
     if total_pages == 0:
         raise ValueError("PDF has no pages.")
 
-    blocks = _extract_blocks(doc)
+    lines = _extract_lines(doc)
     doc.close()
 
-    if not blocks:
+    if not lines:
         raise ValueError("Could not extract text from PDF.")
 
-    chunks = _merge_blocks_into_chunks(blocks)
+    chunks = _chunk_lines(lines)
     if not chunks:
         raise ValueError("PDF text too short to process.")
 
