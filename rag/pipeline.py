@@ -1,17 +1,22 @@
 """
-RAG pipeline — Phase 3 architecture.
+RAG pipeline — Phase 4+5 architecture.
 
-Ingestion:  PDF → Lines → Sentences (with exact bbox) → Chunks
-            Both sentences and chunks stored in Qdrant.
+Phase 4: Multi-column reading order correction
+  - Detects two-column layouts using block x-position analysis
+  - Sorts blocks: left column top→bottom, then right column top→bottom
+  - Prevents sentence/chunk corruption in IEEE, Elsevier, Springer papers
+
+Phase 5: Multi-bounding-box sentence highlighting
+  - Each sentence stores ALL line bboxes (not just the first line)
+  - Frontend renders multiple highlight rectangles per citation
+  - SciSpace-level highlight precision for multi-line sentences
+
+Ingestion:
+  PDF → Column-ordered Lines → Sentences (multi-bbox) → Chunks
+  Both sentences and chunks stored in Qdrant (Phase 4+5 schema).
 
 Citation mapping:
-  LLM answer → per-claim sentence matching → exact sentence bbox → frontend.
-
-Key design decisions:
-  - Reference list pages are excluded from sentence index (numbered refs pattern)
-  - Figure/chart lines filtered by aspect ratio
-  - Citation mapper matches on first-12-word head of claim, not full text
-  - Frontend clamps highlight height to text-line size as final guard
+  LLM answer → per-claim sentence matching → ALL sentence bboxes → frontend.
 """
 import re, uuid, logging
 from vectorstore.qdrant_store import get_store
@@ -23,36 +28,28 @@ from models.schemas import ChatMessage
 logger = logging.getLogger(__name__)
 _chat_history_mem: dict[str, list[ChatMessage]] = {}
 
+
 # ── Line / sentence quality filters ───────────────────────────────────────
 
-# Patterns that identify reference-list lines — exclude from sentence index
-# so the citation mapper never returns a bibliography entry as a highlight
 _REF_LINE_RE = re.compile(
-    r'^(\d{1,3}[\.\)]\s)'          # "1. " or "1) "
-    r'|^\[\d{1,3}\]\s'             # "[1] "
-    r'|https?://'                  # bare URL lines
-    r'|doi\.org/'                  # DOI-only lines
-    r'|10\.\d{4,}/',               # DOI number
+    r'^(\d{1,3}[\.\ )]\s)'
+    r'|^\[\d{1,3}\]\s'
+    r'|https?://'
+    r'|doi\.org/'
+    r'|10\.\d{4,}/',
     re.IGNORECASE
 )
+
 
 def _is_body_text(text: str, bbox: list, page_height: float, page_width: float) -> bool:
     """
     Return True only if this line is likely body text suitable for highlighting.
-    Rejects:
-      - Reference list entries (numbered/bracketed citations)
-      - Figure/table caption regions (based on bbox geometry)
-      - Header/footer zones (top 8% or bottom 8% of page)
-      - Lines that are too short or too narrow
-      - Figure areas (tall bboxes, aspect ratio too low)
+    Rejects reference list entries, figure areas, headers/footers, short/narrow lines.
     """
     if not text or len(text) < 15:
         return False
-
-    # Reference list pattern
     if _REF_LINE_RE.match(text.strip()):
         return False
-
     if not bbox or len(bbox) < 4:
         return False
 
@@ -62,16 +59,11 @@ def _is_body_text(text: str, bbox: list, page_height: float, page_width: float) 
 
     if h <= 0 or w <= 0:
         return False
-
-    # Header/footer zone: top 8% or bottom 8% of page
     if page_height > 0:
         if y0 < page_height * 0.08:
             return False
         if y1 > page_height * 0.92:
             return False
-
-    # Must be a wide, short line (text line geometry)
-    # Text lines: height < 30pt, width > 60pt, aspect ratio > 3
     if h >= 30:
         return False
     if w < 60:
@@ -82,30 +74,109 @@ def _is_body_text(text: str, bbox: list, page_height: float, page_width: float) 
     return True
 
 
-# ── Extraction ─────────────────────────────────────────────────────────────
+# ── Phase 4: Multi-column reading order ───────────────────────────────────
+
+def _detect_column_boundary(blocks: list[dict], page_width: float) -> float | None:
+    """
+    Detect the x-coordinate gap that separates two columns.
+
+    Strategy: collect all block x0 positions. If there is a clear bimodal
+    distribution (left cluster and right cluster), the midpoint between the
+    two clusters is returned as the column boundary. Returns None for
+    single-column pages.
+
+    IEEE/Elsevier papers typically have a 10-15pt gutter between columns.
+    We detect this by finding the largest gap in x0 positions that is
+    between 20% and 70% of the page width (ruling out margins).
+    """
+    if not blocks or page_width <= 0:
+        return None
+
+    x0_positions = sorted({
+        round(b["bbox"][0], 1)
+        for b in blocks
+        if b.get("type") == 0 and b.get("bbox")
+    })
+
+    if len(x0_positions) < 2:
+        return None
+
+    min_x = page_width * 0.20
+    max_x = page_width * 0.70
+
+    best_gap   = 0.0
+    best_mid   = None
+
+    for i in range(len(x0_positions) - 1):
+        gap = x0_positions[i + 1] - x0_positions[i]
+        mid = (x0_positions[i] + x0_positions[i + 1]) / 2
+        if min_x <= mid <= max_x and gap > best_gap:
+            best_gap = gap
+            best_mid = mid
+
+    # Require a meaningful gap (at least 10pt) to call it two-column
+    return best_mid if best_gap >= 10 else None
+
+
+def _sort_blocks_reading_order(
+    blocks: list[dict],
+    col_boundary: float | None,
+    page_height: float,
+) -> list[dict]:
+    """
+    Sort blocks into correct reading order.
+
+    Single-column: top-to-bottom by y0.
+    Two-column:    left column top→bottom, then right column top→bottom.
+
+    Within each column, sort by y0. Ties broken by x0.
+    """
+    text_blocks = [b for b in blocks if b.get("type") == 0 and b.get("bbox")]
+
+    if col_boundary is None:
+        return sorted(text_blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+
+    left  = [b for b in text_blocks if b["bbox"][0] < col_boundary]
+    right = [b for b in text_blocks if b["bbox"][0] >= col_boundary]
+
+    left_sorted  = sorted(left,  key=lambda b: (b["bbox"][1], b["bbox"][0]))
+    right_sorted = sorted(right, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+
+    return left_sorted + right_sorted
+
+
+# ── Phase 4+5: Line extraction with column-correct order ──────────────────
 
 def _extract_lines(doc) -> list[dict]:
     """
-    Extract every text line from pymupdf with exact bbox.
-    Coordinate system: TOP-LEFT origin, y increases downward (same as HTML canvas).
-    Only returns lines that pass _is_body_text filter.
+    Extract body-text lines from PDF in correct reading order.
+
+    Phase 4: Detects and corrects multi-column layout per page so that
+             lines from the left column always precede the right column.
+    Phase 5: Each line carries its own bbox — used later to build multi-bbox
+             sentence objects.
+
+    Coordinate system: TOP-LEFT origin, y increases downward.
     """
     lines = []
+
     for page_num, page in enumerate(doc, start=1):
         pr          = page.rect
         page_height = round(pr.height, 1)
         page_width  = round(pr.width,  1)
 
-        for block in page.get_text("dict").get("blocks", []):
-            if block.get("type") != 0:
-                continue
+        raw_blocks     = page.get_text("dict").get("blocks", [])
+        col_boundary   = _detect_column_boundary(raw_blocks, page_width)
+        ordered_blocks = _sort_blocks_reading_order(raw_blocks, col_boundary, page_height)
+
+        for block in ordered_blocks:
             for line in block.get("lines", []):
                 text = " ".join(
                     s.get("text", "") for s in line.get("spans", [])
                 ).strip()
-                lb = line.get("bbox", block.get("bbox", [0,0,0,0]))
-                bbox = [round(lb[0],1), round(lb[1],1),
-                        round(lb[2],1), round(lb[3],1)]
+                lb   = line.get("bbox", block.get("bbox", [0, 0, 0, 0]))
+                bbox = [round(lb[0], 1), round(lb[1], 1),
+                        round(lb[2], 1), round(lb[3], 1)]
 
                 if not _is_body_text(text, bbox, page_height, page_width):
                     continue
@@ -117,38 +188,69 @@ def _extract_lines(doc) -> list[dict]:
                     "page_width":  page_width,
                     "bbox":        bbox,
                 })
+
     return lines
 
 
+# ── Phase 5: Multi-bbox sentence reconstruction ────────────────────────────
+
 def _lines_to_sentences(lines: list[dict]) -> list[dict]:
     """
-    Reconstruct sentences from filtered body-text lines.
-    Stores bbox of the FIRST LINE of each sentence as the highlight anchor.
+    Reconstruct sentences from body-text lines.
+
+    Phase 5 upgrade: Instead of storing only the FIRST line's bbox,
+    every sentence now stores a 'bboxes' list containing ALL line bboxes
+    that make up that sentence. The frontend renders one highlight
+    rectangle per bbox, giving SciSpace-level multi-line highlighting.
+
+    Schema per sentence:
+    {
+        "text":        str,
+        "page":        int,
+        "page_height": float,
+        "page_width":  float,
+        "bbox":        list[float],   # first-line bbox (backward-compat fallback)
+        "bboxes":      list[list[float]]  # ALL line bboxes ← Phase 5
+    }
     """
-    sentences = []
-    buf_text: list[str] = []
-    anchor: dict | None = None   # first line of current sentence
+    sentences: list[dict] = []
+    buf_text:  list[str]  = []
+    buf_bboxes: list[list] = []
+    anchor: dict | None   = None
 
     for line in lines:
         # Page break — flush whatever we have
         if anchor and line["page"] != anchor["page"]:
             if buf_text:
-                sentences.append({**anchor, "text": " ".join(buf_text).strip()})
-            buf_text = []; anchor = None
+                sentences.append({
+                    **anchor,
+                    "text":   " ".join(buf_text).strip(),
+                    "bboxes": buf_bboxes,
+                })
+            buf_text = []; buf_bboxes = []; anchor = None
 
         if anchor is None:
-            anchor = {k: line[k] for k in ("page","page_height","page_width","bbox")}
+            anchor = {k: line[k] for k in ("page", "page_height", "page_width", "bbox")}
 
         buf_text.append(line["text"])
+        buf_bboxes.append(line["bbox"])
         combined = " ".join(buf_text)
 
-        # Flush on sentence-ending punctuation
+        # Flush on sentence-ending punctuation (min 6 words)
         if re.search(r'[.!?]\s*$', combined) and len(combined.split()) >= 6:
-            sentences.append({**anchor, "text": combined.strip()})
-            buf_text = []; anchor = None
+            sentences.append({
+                **anchor,
+                "text":   combined.strip(),
+                "bboxes": list(buf_bboxes),
+            })
+            buf_text = []; buf_bboxes = []; anchor = None
 
     if buf_text and anchor:
-        sentences.append({**anchor, "text": " ".join(buf_text).strip()})
+        sentences.append({
+            **anchor,
+            "text":   " ".join(buf_text).strip(),
+            "bboxes": list(buf_bboxes),
+        })
 
     return [s for s in sentences if len(s["text"].split()) >= 5]
 
@@ -161,11 +263,10 @@ def _sentences_to_chunks(
     """
     Group sentences into chunks for embedding.
     Chunks store sentence_indices so citation mapper can look up exact sentences.
-    new_start tracks which sentences are overlap vs new content.
     """
     chunks:    list[dict] = []
-    buf:       list[int]  = []   # sentence indices in buffer
-    new_start: int        = 0    # index in buf of first non-overlap sentence
+    buf:       list[int]  = []
+    new_start: int        = 0
 
     def flush():
         if not buf:
@@ -181,6 +282,7 @@ def _sentences_to_chunks(
             "page_height":      anchor["page_height"],
             "page_width":       anchor["page_width"],
             "bbox":             anchor["bbox"],
+            "bboxes":           anchor.get("bboxes", [anchor["bbox"]]),
             "sentence_indices": list(buf),
         })
 
@@ -201,25 +303,21 @@ def _sentences_to_chunks(
 # ── Citation mapper ────────────────────────────────────────────────────────
 
 def _norm(text: str) -> str:
-    """Lowercase, remove punctuation, collapse whitespace."""
     text = text.lower()
     text = re.sub(r'[^\w\s]', ' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
 
 def find_best_sentence(
-    claim: str,
-    chunk_result: dict,
+    claim:         str,
+    chunk_result:  dict,
     all_sentences: list[dict],
 ) -> dict | None:
     """
-    Find the sentence in a chunk whose HEAD best matches the claim head.
+    Find the sentence whose head best matches the claim head.
 
-    Strategy: compare first 12 words of claim against first 12 words of
-    each candidate sentence. Head-matching is 3× weighted over full overlap.
-    This ensures the highlight lands at the START of the cited passage.
-
-    Rejects sentences that fail body-text geometry (reference list, figures).
+    Returns the full sentence dict (including 'bboxes' list for Phase 5
+    multi-highlight). Falls back to None if no match exceeds threshold.
     """
     norm_claim  = _norm(claim)
     if not norm_claim:
@@ -237,7 +335,6 @@ def find_best_sentence(
             continue
         sent = all_sentences[si]
 
-        # Skip any sentence that slipped through with bad geometry
         bbox = sent.get("bbox")
         if bbox and not _is_body_text(
             sent["text"], bbox,
@@ -259,7 +356,6 @@ def find_best_sentence(
             best_score = score
             best_sent  = sent
 
-    # Require at least 2 head words matching (score ≥ 6)
     return best_sent if best_score >= 6 else None
 
 
@@ -316,7 +412,7 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
         raise ValueError("PDF text too short to process.")
 
     store = get_store()
-    n     = store.ingest_phase3(session_id, chunks, sentences, filename)
+    n     = store.ingest_phase45(session_id, chunks, sentences, filename)
 
     if get_settings().database_url:
         try:
@@ -327,15 +423,23 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
             )
             await insert_event(
                 event_type="pdf_upload",
-                meta={"filename": filename, "chunks": n,
-                      "sentences": len(sentences),
-                      "pages": total_pages, "session_id": session_id},
+                meta={
+                    "filename":  filename,
+                    "chunks":    n,
+                    "sentences": len(sentences),
+                    "pages":     total_pages,
+                    "session_id": session_id,
+                    "phase":     "4+5",
+                },
             )
         except Exception as e:
             logger.warning(f"DB session persist failed (non-fatal): {e}")
 
     _chat_history_mem[session_id] = []
-    logger.info(f"PDF ingested: {filename} → {n} chunks, {len(sentences)} sentences, {total_pages} pages")
+    logger.info(
+        f"PDF ingested (Phase 4+5): {filename} → "
+        f"{n} chunks, {len(sentences)} sentences, {total_pages} pages"
+    )
     return session_id
 
 
@@ -343,15 +447,14 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
 
 def _build_sources(results: list[dict], answer: str, sentences: list[dict]) -> list[dict]:
     """
-    Map each [N] citation in the answer to an exact sentence bbox.
+    Map each [N] citation in the LLM answer to an exact sentence.
 
-    1. Split answer into sentences, find which refs each sentence uses.
-    2. For each ref, find the best matching sentence in the retrieved chunk.
-    3. Return structured sources with exact page + bbox for the frontend.
+    Phase 5: Returns 'bboxes' list (all line bboxes) so the frontend can
+    render multiple highlight rectangles — one per physical line of text.
+    Also returns 'bbox' (first line) as a backward-compatible fallback.
     """
     ref_pat = re.compile(r'\[(\d+)\]')
 
-    # Map ref number → the answer-sentence that used it (stripped of markers)
     ref_to_claim: dict[int, str] = {}
     for ans_sent in re.split(r'(?<=[.!?])\s+', answer):
         refs  = [int(m) for m in ref_pat.findall(ans_sent)]
@@ -365,13 +468,15 @@ def _build_sources(results: list[dict], answer: str, sentences: list[dict]) -> l
         text    = r.get("text", "")
         snippet = text[:200].strip() + ("…" if len(text) > 200 else "")
         page    = r.get("page", 1)
-        bbox    = r.get("bbox")          # chunk anchor (fallback)
+        bbox    = r.get("bbox")
+        bboxes  = r.get("bboxes") or ([bbox] if bbox else [])
 
         claim = ref_to_claim.get(i, "")
         if claim and sentences:
             best = find_best_sentence(claim, r, sentences)
             if best:
                 bbox    = best["bbox"]
+                bboxes  = best.get("bboxes") or [bbox]
                 snippet = best["text"]
                 page    = best["page"]
 
@@ -380,7 +485,8 @@ def _build_sources(results: list[dict], answer: str, sentences: list[dict]) -> l
             "page":        page,
             "page_height": r.get("page_height"),
             "page_width":  r.get("page_width"),
-            "bbox":        bbox,
+            "bbox":        bbox,           # first-line fallback
+            "bboxes":      bboxes,         # ← Phase 5: all line bboxes
             "snippet":     snippet,
         })
 
@@ -409,7 +515,7 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
     results.sort(key=lambda r: r["score"], reverse=True)
 
     context = "\n\n".join(
-        f'[{i}] (page {r.get("page",1)})\n"{r.get("text","")}"'
+        f'[{i}] (page {r.get("page", 1)})\n"{r.get("text", "")}"'
         for i, r in enumerate(results, start=1)
     )
     system   = PDF_CHAT_SYSTEM.format(context=context)
@@ -472,7 +578,7 @@ async def extract_properties(session_id: str) -> list[dict]:
         messages=[{"role": "user", "content": f"{PROPERTY_EXTRACT}\n\nTEXT:\n{context}"}],
         max_tokens=2048, prefer_json=True, task="property_extract",
     )
-    raw = raw.strip().replace("```json","").replace("```","").strip()
+    raw = raw.strip().replace("```json", "").replace("```", "").strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
