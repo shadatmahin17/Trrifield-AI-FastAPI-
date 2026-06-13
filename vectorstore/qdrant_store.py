@@ -1,6 +1,6 @@
 """
 Qdrant vector store — position-aware ingestion.
-Each point payload: { text, page, bbox, chunk_index, source }
+Payload per point: { text, page, page_height, page_width, bbox, chunk_index, source }
 """
 import logging
 from typing import Optional
@@ -25,9 +25,7 @@ def _get_qdrant_client():
     from qdrant_client import QdrantClient
     s = get_settings()
     if s.qdrant_url and s.qdrant_api_key:
-        logger.info("Using Qdrant Cloud")
         return QdrantClient(url=s.qdrant_url, api_key=s.qdrant_api_key)
-    logger.info(f"Using local Qdrant at {s.qdrant_local_path}")
     return QdrantClient(path=s.qdrant_local_path)
 
 
@@ -36,7 +34,6 @@ class QdrantPDFStore:
     def __init__(self):
         self._client   = None
         self._embed_fn = None
-        self._sessions: dict[str, dict] = {}
 
     def _get_client(self):
         if self._client is None or self._embed_fn is None:
@@ -44,7 +41,7 @@ class QdrantPDFStore:
             self._embed_fn = _get_embedding_model()
         return self._client
 
-    _client_ = _get_client  # alias for health probe
+    _client_ = _get_client
 
     def _col(self, session_id: str) -> str:
         return f"{COLLECTION_PREFIX}{session_id}"
@@ -53,21 +50,17 @@ class QdrantPDFStore:
         result = self._embed_fn(texts)
         return result if isinstance(result[0], list) else [list(r) for r in result]
 
-    # ── Legacy ingest (plain text chunks, no position) ─────────────────────
     def ingest(self, session_id: str, chunks: list[str], filename: str) -> int:
-        positioned = [
-            {"text": c, "page": 1, "bbox": None}
-            for c in chunks
-        ]
+        """Fallback: plain text list, no position."""
+        positioned = [{"text": c, "page": 1, "page_height": None,
+                       "page_width": None, "bbox": None} for c in chunks]
         return self.ingest_with_positions(session_id, positioned, filename)
 
-    # ── Position-aware ingest ──────────────────────────────────────────────
-    def ingest_with_positions(
-        self,
-        session_id: str,
-        chunks: list[dict],   # [{text, page, bbox}, ...]
-        filename:   str,
-    ) -> int:
+    def ingest_with_positions(self, session_id: str, chunks: list[dict], filename: str) -> int:
+        """
+        Store chunks with full position metadata.
+        chunks: [{text, page, page_height, page_width, bbox}, ...]
+        """
         from qdrant_client.models import VectorParams, Distance, PointStruct
 
         client = self._get_client()
@@ -79,8 +72,6 @@ class QdrantPDFStore:
         )
 
         texts = [c["text"] for c in chunks]
-
-        # Embed in batches of 32
         all_embeddings = []
         for i in range(0, len(texts), 32):
             all_embeddings.extend(self._embed(texts[i:i+32]))
@@ -93,15 +84,16 @@ class QdrantPDFStore:
                     "text":        chunks[i]["text"],
                     "chunk_index": i,
                     "page":        chunks[i].get("page", 1),
-                    "bbox":        chunks[i].get("bbox"),   # [x0,y0,x1,y1] or None
+                    "page_height": chunks[i].get("page_height"),
+                    "page_width":  chunks[i].get("page_width"),
+                    "bbox":        chunks[i].get("bbox"),
                     "source":      filename,
                 },
             )
             for i in range(len(chunks))
         ]
         client.upsert(collection_name=col, points=points)
-        self._sessions[session_id] = {"filename": filename, "chunk_count": len(chunks)}
-        logger.info(f"Qdrant: stored {len(chunks)} positioned chunks for {session_id}")
+        logger.info(f"Qdrant: stored {len(chunks)} chunks for session {session_id}")
         return len(chunks)
 
     def search(self, session_id: str, query: str, top_k: int = 5) -> list[dict]:
@@ -117,6 +109,8 @@ class QdrantPDFStore:
                 "text":        r.payload.get("text", ""),
                 "chunk_index": r.payload.get("chunk_index", 0),
                 "page":        r.payload.get("page", 1),
+                "page_height": r.payload.get("page_height"),
+                "page_width":  r.payload.get("page_width"),
                 "bbox":        r.payload.get("bbox"),
                 "source":      r.payload.get("source", ""),
                 "score":       r.score,
@@ -127,7 +121,6 @@ class QdrantPDFStore:
     def delete_session(self, session_id: str):
         try:
             self._get_client().delete_collection(self._col(session_id))
-            self._sessions.pop(session_id, None)
         except Exception as e:
             logger.warning(f"Could not delete session {session_id}: {e}")
 
