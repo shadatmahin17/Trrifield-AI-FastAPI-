@@ -21,11 +21,15 @@ _chat_history_mem: dict[str, list[ChatMessage]] = {}
 
 def _extract_blocks(doc) -> list[dict]:
     """
-    Extract text blocks from pymupdf preserving page, bbox, and page_height.
+    Extract text blocks from pymupdf with FIRST-LINE bbox as the highlight anchor.
+
+    Using get_text("dict") gives us line-level bboxes. We store:
+      - full block text (for embedding quality)
+      - bbox of the FIRST LINE only (for tight highlight — not the whole paragraph)
+      - page, page_height, page_width
 
     pymupdf coordinate system: TOP-LEFT origin, y increases downward.
-    bbox = [x0, y0, x1, y1] in PDF points (1 point = 1/72 inch).
-    page_height stored so frontend can scale to canvas pixels.
+    bbox = [x0, y0, x1, y1] in PDF points (1/72 inch each).
     """
     blocks = []
     for page_num, page in enumerate(doc, start=1):
@@ -33,17 +37,40 @@ def _extract_blocks(doc) -> list[dict]:
         page_height = round(page_rect.height, 1)
         page_width  = round(page_rect.width,  1)
 
-        for block in page.get_text("blocks"):
-            x0, y0, x1, y1, text, *_ = block
-            text = text.strip()
-            if text and len(text.split()) > 5:
-                blocks.append({
-                    "text":        text,
-                    "page":        page_num,
-                    "page_height": page_height,
-                    "page_width":  page_width,
-                    "bbox":        [round(x0,1), round(y0,1), round(x1,1), round(y1,1)],
-                })
+        page_dict = page.get_text("dict")
+        for block in page_dict.get("blocks", []):
+            # Skip image blocks (type=1), only text blocks (type=0)
+            if block.get("type") != 0:
+                continue
+
+            lines = block.get("lines", [])
+            if not lines:
+                continue
+
+            # Full text of the block for embedding
+            full_text = " ".join(
+                " ".join(span.get("text", "") for span in line.get("spans", []))
+                for line in lines
+            ).strip()
+
+            if not full_text or len(full_text.split()) < 5:
+                continue
+
+            # Bbox of FIRST LINE only — gives a tight single-line highlight
+            first_line = lines[0]
+            fl = first_line.get("bbox", block["bbox"])
+            first_line_bbox = [
+                round(fl[0], 1), round(fl[1], 1),
+                round(fl[2], 1), round(fl[3], 1),
+            ]
+
+            blocks.append({
+                "text":        full_text,
+                "page":        page_num,
+                "page_height": page_height,
+                "page_width":  page_width,
+                "bbox":        first_line_bbox,
+            })
     return blocks
 
 
