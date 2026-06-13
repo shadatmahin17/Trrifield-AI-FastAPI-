@@ -38,17 +38,18 @@ class ChatMessage(BaseModel):
     role:    str
     content: str
 
-# Structured citation source — page + bbox for click-to-highlight
 class CitationSource(BaseModel):
-    ref:     int              # citation number [1], [2] etc.
-    page:    int              # 1-based page number
-    bbox:    Optional[list[float]]  # [x0, y0, x1, y1] in PDF points
-    snippet: str              # first ~180 chars of the chunk
+    ref:         int
+    page:        int
+    page_height: Optional[float] = None   # PDF page height in points
+    page_width:  Optional[float] = None   # PDF page width in points
+    bbox:        Optional[list[float]] = None  # [x0,y0,x1,y1] top-left origin
+    snippet:     str
 
 class ChatResponse(BaseModel):
     session_id: str
     answer:     str
-    sources:    list[CitationSource]   # structured, not raw strings
+    sources:    list[CitationSource]
     history:    list[ChatMessage]
 
 
@@ -61,8 +62,8 @@ class PropertyRow(BaseModel):
     page_ref:      Optional[Any]
 
 class PropertyExtractionResponse(BaseModel):
-    session_id:  str
-    properties:  list[PropertyRow]
+    session_id: str
+    properties: list[PropertyRow]
 
 
 # ── Citations ─────────────────────────────────────────────────────────────
