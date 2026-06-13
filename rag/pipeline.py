@@ -70,18 +70,17 @@ def _chunk_lines(
     """
     Merge lines into ~chunk_words chunks.
 
-    HIGHLIGHT ANCHOR FIX:
-    When overlap carries lines from the previous chunk forward, those
-    overlap lines are NOT the semantic start of the new chunk — they're
-    carried-over context. The bbox must point to the FIRST NEW line
-    (i.e. the line after the overlap), not the first overlap line.
+    HIGHLIGHT ANCHOR:
+    Each chunk has overlap lines at the start (carried from previous chunk)
+    followed by new lines. The highlight must point to the FIRST NEW line —
+    not the first overlap line.
 
-    We track this with `anchor_idx` — the index in buf_lines where
-    new (non-overlap) content starts.
+    We track this with `new_start` — set to len(overlap) after each flush,
+    then clamped to the last line if the chunk ends before adding new lines.
     """
-    chunks   = []
+    chunks    = []
     buf_lines: list[dict] = []
-    anchor_idx = 0   # index of first NEW line in buf_lines
+    new_start = 0   # index of first genuinely new line in buf_lines
 
     def flush():
         if not buf_lines:
@@ -89,18 +88,19 @@ def _chunk_lines(
         text = " ".join(l["text"] for l in buf_lines)
         if len(text.split()) < 15:
             return
-        # Use the first NEW line (after overlap) as the highlight anchor
-        anchor = buf_lines[anchor_idx]
+        # Clamp new_start — if chunk ended exactly on overlap boundary
+        # use the last line rather than going out of bounds
+        idx    = min(new_start, len(buf_lines) - 1)
+        anchor = buf_lines[idx]
         pw     = anchor.get("page_width") or 595.0
         b      = anchor["bbox"]
-        # Extend x1 to cover full text width (two-column fix)
-        wide_bbox = [b[0], b[1], round(pw - 50, 1), b[3]]
         chunks.append({
             "text":        text,
             "page":        anchor["page"],
             "page_height": anchor["page_height"],
             "page_width":  anchor["page_width"],
-            "bbox":        wide_bbox,
+            # Extend x1 to page_width-50 to cover two-column layouts
+            "bbox": [b[0], b[1], round(pw - 50, 1), b[3]],
         })
 
     for line in lines:
@@ -109,17 +109,14 @@ def _chunk_lines(
 
         if word_count >= chunk_words:
             flush()
-            # Keep last overlap_lines as context for next chunk
             overlap    = buf_lines[-overlap_lines:]
             buf_lines  = list(overlap)
-            anchor_idx = 0   # all lines in new buffer are overlap initially
-            # The next NEW line added will update anchor_idx
-            # We set anchor_idx to len(overlap) so first new line becomes anchor
-            anchor_idx = len(overlap)
+            # new_start points past the overlap lines —
+            # the very next line appended will be the first new content
+            new_start  = len(overlap)
 
-    # Flush remaining
+    # Flush remainder
     if buf_lines:
-        anchor_idx = min(anchor_idx, len(buf_lines) - 1)
         flush()
 
     return chunks
