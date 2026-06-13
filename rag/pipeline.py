@@ -48,17 +48,23 @@ def _extract_blocks(doc) -> list[dict]:
 
 
 def _merge_blocks_into_chunks(
-    blocks:       list[dict],
-    chunk_words:  int = 350,
-    overlap_words:int = 60,
+    blocks:        list[dict],
+    chunk_words:   int = 350,
+    overlap_words: int = 60,
 ) -> list[dict]:
     """
     Merge blocks into ~chunk_words chunks.
-    Each chunk keeps page, page_height, page_width, and union bbox.
+
+    BUG FIX: previously used union_bbox across all blocks in a chunk,
+    which produced a bbox spanning the full page — making the highlight
+    cover the entire page yellow.
+
+    Now we store the bbox of the FIRST block only as the anchor.
+    This gives a tight, accurate highlight at the start of the passage.
     """
     chunks   = []
     buf_text = []
-    buf_meta = {}   # page, page_height, page_width, bbox
+    buf_meta = {}
 
     def flush():
         if not buf_text or not buf_meta:
@@ -67,27 +73,25 @@ def _merge_blocks_into_chunks(
         if len(text.split()) > 15:
             chunks.append({**buf_meta, "text": text})
 
-    def union_bbox(a, b):
-        if a is None: return b
-        if b is None: return a
-        return [min(a[0],b[0]), min(a[1],b[1]), max(a[2],b[2]), max(a[3],b[3])]
-
     for blk in blocks:
-        if not buf_meta:
+        is_new_chunk = not buf_meta
+
+        if is_new_chunk:
+            # Anchor bbox = first block of this chunk only
             buf_meta = {
                 "page":        blk["page"],
                 "page_height": blk["page_height"],
                 "page_width":  blk["page_width"],
-                "bbox":        blk["bbox"],
+                "bbox":        blk["bbox"],   # first block — tight highlight
             }
 
         buf_text.extend(blk["text"].split())
-        buf_meta["bbox"] = union_bbox(buf_meta["bbox"], blk["bbox"])
 
         if len(buf_text) >= chunk_words:
             flush()
-            overlap = buf_text[-overlap_words:]
+            overlap  = buf_text[-overlap_words:]
             buf_text = list(overlap)
+            # New chunk starts at current block
             buf_meta = {
                 "page":        blk["page"],
                 "page_height": blk["page_height"],
