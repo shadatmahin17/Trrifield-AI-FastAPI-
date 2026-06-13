@@ -22,15 +22,8 @@ _chat_history_mem: dict[str, list[ChatMessage]] = {}
 def _extract_lines(doc) -> list[dict]:
     """
     Extract every text line from the PDF with its own bbox.
-
-    Working at LINE level (not block level) means:
-    - Each line has its own tight bbox
-    - When we chunk lines together, the first line of each chunk
-      has the exact bbox where that chunk's text actually starts
-    - No more "first line of block" vs "first line of chunk" mismatch
-
     pymupdf coordinate system: TOP-LEFT origin, y increases downward.
-    bbox = [x0, y0, x1, y1] in PDF points (1/72 inch).
+    bbox = [x0, y0, x1, y1] in PDF points.
     """
     lines = []
     for page_num, page in enumerate(doc, start=1):
@@ -40,16 +33,14 @@ def _extract_lines(doc) -> list[dict]:
 
         page_dict = page.get_text("dict")
         for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:   # skip image blocks
+            if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
-                # Join all spans in this line into one string
                 text = " ".join(
                     span.get("text", "") for span in line.get("spans", [])
                 ).strip()
                 if not text or len(text) < 10:
                     continue
-
                 lb = line.get("bbox", block["bbox"])
                 lines.append({
                     "text":        text,
@@ -62,6 +53,46 @@ def _extract_lines(doc) -> list[dict]:
     return lines
 
 
+def _find_sentence_bbox(sentence_start: str, lines: list[dict], page_width: float) -> list[float] | None:
+    """
+    Find the bbox of the line that best matches the start of a sentence.
+    Tries exact prefix match first, then fuzzy word overlap.
+    Returns wide bbox (extended to page_width-50) or None.
+    """
+    if not sentence_start:
+        return None
+
+    # Normalise: lowercase, collapse whitespace, strip hyphens from line-breaks
+    def norm(t):
+        return " ".join(t.lower().replace("-\n", "").split())
+
+    target = norm(sentence_start[:80])
+    best_score = 0
+    best_line  = None
+
+    target_words = set(target.split())
+
+    for line in lines:
+        lt = norm(line["text"])
+        # Exact prefix match — strongest signal
+        if target.startswith(lt[:30]) or lt.startswith(target[:30]):
+            score = 100 + len(lt)
+        else:
+            # Word overlap score
+            lw    = set(lt.split())
+            score = len(target_words & lw) * 2 - abs(len(target_words) - len(lw))
+
+        if score > best_score:
+            best_score = score
+            best_line  = line
+
+    if best_line and best_score > 3:
+        b  = best_line["bbox"]
+        pw = page_width or 595.0
+        return [b[0], b[1], round(pw - 50, 1), b[3]]
+    return None
+
+
 def _chunk_lines(
     lines:         list[dict],
     chunk_words:   int = 350,
@@ -70,17 +101,17 @@ def _chunk_lines(
     """
     Merge lines into ~chunk_words chunks.
 
-    HIGHLIGHT ANCHOR:
-    Each chunk has overlap lines at the start (carried from previous chunk)
-    followed by new lines. The highlight must point to the FIRST NEW line —
-    not the first overlap line.
-
-    We track this with `new_start` — set to len(overlap) after each flush,
-    then clamped to the last line if the chunk ends before adding new lines.
+    Each chunk stores:
+      - text: full chunk text
+      - page, page_height, page_width, bbox: anchor for the chunk start
+      - sentences: list of {text, bbox} for every sentence in the chunk
+                   so the backend can find the exact line Claude cited
     """
+    import re
+
     chunks    = []
     buf_lines: list[dict] = []
-    new_start = 0   # index of first genuinely new line in buf_lines
+    new_start = 0
 
     def flush():
         if not buf_lines:
@@ -88,34 +119,42 @@ def _chunk_lines(
         text = " ".join(l["text"] for l in buf_lines)
         if len(text.split()) < 15:
             return
-        # Clamp new_start — if chunk ended exactly on overlap boundary
-        # use the last line rather than going out of bounds
+
         idx    = min(new_start, len(buf_lines) - 1)
         anchor = buf_lines[idx]
         pw     = anchor.get("page_width") or 595.0
         b      = anchor["bbox"]
+
+        # Build per-sentence bbox index for this chunk
+        # Split into sentences, find each one's line bbox
+        page_lines = [l for l in buf_lines if l["page"] == anchor["page"]]
+        raw_sentences = re.split(r'(?<=[.!?])\s+', text)
+        sentences = []
+        for sent in raw_sentences:
+            sent = sent.strip()
+            if len(sent) < 20:
+                continue
+            sbbox = _find_sentence_bbox(sent, page_lines, pw)
+            sentences.append({"text": sent, "bbox": sbbox})
+
         chunks.append({
             "text":        text,
             "page":        anchor["page"],
             "page_height": anchor["page_height"],
-            "page_width":  anchor["page_width"],
-            # Extend x1 to page_width-50 to cover two-column layouts
-            "bbox": [b[0], b[1], round(pw - 50, 1), b[3]],
+            "page_width":  pw,
+            "bbox":        [b[0], b[1], round(pw - 50, 1), b[3]],
+            "sentences":   sentences,
         })
 
     for line in lines:
         buf_lines.append(line)
         word_count = sum(len(l["text"].split()) for l in buf_lines)
-
         if word_count >= chunk_words:
             flush()
-            overlap    = buf_lines[-overlap_lines:]
-            buf_lines  = list(overlap)
-            # new_start points past the overlap lines —
-            # the very next line appended will be the first new content
-            new_start  = len(overlap)
+            overlap   = buf_lines[-overlap_lines:]
+            buf_lines = list(overlap)
+            new_start = len(overlap)
 
-    # Flush remainder
     if buf_lines:
         flush()
 
