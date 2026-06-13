@@ -40,6 +40,17 @@ _REF_LINE_RE = re.compile(
     re.IGNORECASE
 )
 
+_REFERENCE_HEADING_RE = re.compile(
+    r'^\s*(references|bibliography|works cited|literature cited)\s*$',
+    re.IGNORECASE
+)
+
+_NON_BODY_HEADING_RE = re.compile(
+    r'^\s*(data availability statement|acknowledg(e)?ments?|conflicts? of interest|'
+    r'author contributions?|funding|supplementary materials?)\s*$',
+    re.IGNORECASE
+)
+
 
 def _is_body_text(text: str, bbox: list, page_height: float, page_width: float) -> bool:
     """
@@ -48,7 +59,17 @@ def _is_body_text(text: str, bbox: list, page_height: float, page_width: float) 
     """
     if not text or len(text) < 15:
         return False
-    if _REF_LINE_RE.match(text.strip()):
+    stripped = text.strip()
+    if _REFERENCE_HEADING_RE.match(stripped) or _NON_BODY_HEADING_RE.match(stripped):
+        return False
+    if _REF_LINE_RE.match(stripped):
+        return False
+    # Reference entries frequently start with a number embedded in a wrapped
+    # column line. Reject lines that look citation-heavy even if the DOI/URL is
+    # not at the beginning of the line.
+    if re.search(r'(https?://|doi\.org/|10\.\d{4,}/)', stripped, re.IGNORECASE):
+        return False
+    if re.match(r'^\s*\d{1,3}\.\s+[A-Z][\w\-.]+,', stripped):
         return False
     if not bbox or len(bbox) < 4:
         return False
@@ -164,6 +185,7 @@ def _extract_lines(doc) -> list[dict]:
         pr          = page.rect
         page_height = round(pr.height, 1)
         page_width  = round(pr.width,  1)
+        in_reference_section = False
 
         raw_blocks     = page.get_text("dict").get("blocks", [])
         col_boundary   = _detect_column_boundary(raw_blocks, page_width)
@@ -177,6 +199,12 @@ def _extract_lines(doc) -> list[dict]:
                 lb   = line.get("bbox", block.get("bbox", [0, 0, 0, 0]))
                 bbox = [round(lb[0], 1), round(lb[1], 1),
                         round(lb[2], 1), round(lb[3], 1)]
+
+                if _REFERENCE_HEADING_RE.match(text):
+                    in_reference_section = True
+                    continue
+                if in_reference_section:
+                    continue
 
                 if not _is_body_text(text, bbox, page_height, page_width):
                     continue
@@ -276,6 +304,13 @@ def _sentences_to_chunks(
             return
         idx    = min(new_start, len(buf) - 1)
         anchor = sentences[buf[idx]]
+        if not _is_body_text(
+            anchor["text"],
+            anchor.get("bbox"),
+            anchor.get("page_height", 841),
+            anchor.get("page_width", 595),
+        ):
+            return
         chunks.append({
             "text":             text,
             "page":             anchor["page"],
@@ -357,6 +392,28 @@ def find_best_sentence(
             best_sent  = sent
 
     return best_sent if best_score >= 6 else None
+
+
+def _safe_source_bboxes(bbox: list | None, bboxes: list | None) -> list:
+    """
+    Return highlight boxes that are safe for a single cited source.
+
+    Exact sentence matches may legitimately span a few physical PDF lines, but
+    large bbox lists are almost always chunk/paragraph fallbacks and create the
+    full-column yellow overlays seen in the UI. In that case, degrade to the
+    first-line bbox only.
+    """
+    cleaned = [
+        b for b in (bboxes or [])
+        if isinstance(b, list) and len(b) >= 4
+    ]
+    if bbox and (not isinstance(bbox, list) or len(bbox) < 4):
+        bbox = None
+    if len(cleaned) > 4:
+        return [bbox or cleaned[0]]
+    if cleaned:
+        return cleaned
+    return [bbox] if bbox else []
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────
@@ -469,16 +526,22 @@ def _build_sources(results: list[dict], answer: str, sentences: list[dict]) -> l
         snippet = text[:200].strip() + ("…" if len(text) > 200 else "")
         page    = r.get("page", 1)
         bbox    = r.get("bbox")
-        bboxes  = r.get("bboxes") or ([bbox] if bbox else [])
+        # Never use chunk-level multi-bboxes as the default highlight. They can
+        # represent a whole paragraph/chunk when exact sentence matching fails.
+        bboxes  = [bbox] if bbox else []
 
         claim = ref_to_claim.get(i, "")
         if claim and sentences:
             best = find_best_sentence(claim, r, sentences)
             if best:
                 bbox    = best["bbox"]
-                bboxes  = best.get("bboxes") or [bbox]
+                bboxes  = _safe_source_bboxes(bbox, best.get("bboxes"))
                 snippet = best["text"]
                 page    = best["page"]
+            else:
+                bboxes = _safe_source_bboxes(bbox, None)
+        else:
+            bboxes = _safe_source_bboxes(bbox, None)
 
         sources.append({
             "ref":         i,
