@@ -1,17 +1,17 @@
 """
 RAG pipeline — Phase 3 architecture.
 
-Ingestion:
-  PDF → Lines → Sentences (with bbox) + Chunks
-  Both stored in Qdrant:
-    pdf_chunks_{session}    — for broad retrieval
-    pdf_sentences_{session} — for exact citation matching
+Ingestion:  PDF → Lines → Sentences (with exact bbox) → Chunks
+            Both sentences and chunks stored in Qdrant.
 
-Search flow:
-  Question → Chunk search → Top chunks → Sentence search → Exact sentence
-  LLM answer → Citation mapper → Exact sentence bbox → Frontend
+Citation mapping:
+  LLM answer → per-claim sentence matching → exact sentence bbox → frontend.
 
-This gives ~97-99% highlight accuracy matching SciSpace behaviour.
+Key design decisions:
+  - Reference list pages are excluded from sentence index (numbered refs pattern)
+  - Figure/chart lines filtered by aspect ratio
+  - Citation mapper matches on first-12-word head of claim, not full text
+  - Frontend clamps highlight height to text-line size as final guard
 """
 import re, uuid, logging
 from vectorstore.qdrant_store import get_store
@@ -21,22 +21,81 @@ from prompts.templates import PDF_CHAT_SYSTEM, PROPERTY_EXTRACT
 from models.schemas import ChatMessage
 
 logger = logging.getLogger(__name__)
-
 _chat_history_mem: dict[str, list[ChatMessage]] = {}
 
+# ── Line / sentence quality filters ───────────────────────────────────────
 
-# ── Text extraction ────────────────────────────────────────────────────────
+# Patterns that identify reference-list lines — exclude from sentence index
+# so the citation mapper never returns a bibliography entry as a highlight
+_REF_LINE_RE = re.compile(
+    r'^(\d{1,3}[\.\)]\s)'          # "1. " or "1) "
+    r'|^\[\d{1,3}\]\s'             # "[1] "
+    r'|https?://'                  # bare URL lines
+    r'|doi\.org/'                  # DOI-only lines
+    r'|10\.\d{4,}/',               # DOI number
+    re.IGNORECASE
+)
+
+def _is_body_text(text: str, bbox: list, page_height: float, page_width: float) -> bool:
+    """
+    Return True only if this line is likely body text suitable for highlighting.
+    Rejects:
+      - Reference list entries (numbered/bracketed citations)
+      - Figure/table caption regions (based on bbox geometry)
+      - Header/footer zones (top 8% or bottom 8% of page)
+      - Lines that are too short or too narrow
+      - Figure areas (tall bboxes, aspect ratio too low)
+    """
+    if not text or len(text) < 15:
+        return False
+
+    # Reference list pattern
+    if _REF_LINE_RE.match(text.strip()):
+        return False
+
+    if not bbox or len(bbox) < 4:
+        return False
+
+    x0, y0, x1, y1 = bbox
+    w = x1 - x0
+    h = y1 - y0
+
+    if h <= 0 or w <= 0:
+        return False
+
+    # Header/footer zone: top 8% or bottom 8% of page
+    if page_height > 0:
+        if y0 < page_height * 0.08:
+            return False
+        if y1 > page_height * 0.92:
+            return False
+
+    # Must be a wide, short line (text line geometry)
+    # Text lines: height < 30pt, width > 60pt, aspect ratio > 3
+    if h >= 30:
+        return False
+    if w < 60:
+        return False
+    if (w / h) < 3:
+        return False
+
+    return True
+
+
+# ── Extraction ─────────────────────────────────────────────────────────────
 
 def _extract_lines(doc) -> list[dict]:
     """
     Extract every text line from pymupdf with exact bbox.
-    Coordinate system: TOP-LEFT origin, y increases downward (same as canvas).
+    Coordinate system: TOP-LEFT origin, y increases downward (same as HTML canvas).
+    Only returns lines that pass _is_body_text filter.
     """
     lines = []
     for page_num, page in enumerate(doc, start=1):
         pr          = page.rect
         page_height = round(pr.height, 1)
         page_width  = round(pr.width,  1)
+
         for block in page.get_text("dict").get("blocks", []):
             if block.get("type") != 0:
                 continue
@@ -44,76 +103,52 @@ def _extract_lines(doc) -> list[dict]:
                 text = " ".join(
                     s.get("text", "") for s in line.get("spans", [])
                 ).strip()
-                if not text or len(text) < 8:
+                lb = line.get("bbox", block.get("bbox", [0,0,0,0]))
+                bbox = [round(lb[0],1), round(lb[1],1),
+                        round(lb[2],1), round(lb[3],1)]
+
+                if not _is_body_text(text, bbox, page_height, page_width):
                     continue
-                lb = line.get("bbox", block["bbox"])
+
                 lines.append({
                     "text":        text,
                     "page":        page_num,
                     "page_height": page_height,
                     "page_width":  page_width,
-                    "bbox":        [round(lb[0],1), round(lb[1],1),
-                                    round(lb[2],1), round(lb[3],1)],
+                    "bbox":        bbox,
                 })
     return lines
 
 
 def _lines_to_sentences(lines: list[dict]) -> list[dict]:
     """
-    Reconstruct sentences from lines, preserving the bbox of the first line
-    of each sentence (the line where it starts on the page).
-
-    Two-column fix: x1 is left as the actual line x1 (not extended),
-    because sentences rarely span columns and extending caused false-wide highlights.
+    Reconstruct sentences from filtered body-text lines.
+    Stores bbox of the FIRST LINE of each sentence as the highlight anchor.
     """
     sentences = []
-    buf_text  = []
-    buf_bbox  = None
-    buf_page  = None
-    buf_ph    = None
-    buf_pw    = None
+    buf_text: list[str] = []
+    anchor: dict | None = None   # first line of current sentence
 
     for line in lines:
-        # New sentence starts fresh on page change
-        if buf_page is not None and line["page"] != buf_page:
+        # Page break — flush whatever we have
+        if anchor and line["page"] != anchor["page"]:
             if buf_text:
-                sentences.append({
-                    "text":        " ".join(buf_text),
-                    "page":        buf_page,
-                    "page_height": buf_ph,
-                    "page_width":  buf_pw,
-                    "bbox":        buf_bbox,
-                })
-            buf_text = []; buf_bbox = None; buf_page = None
+                sentences.append({**anchor, "text": " ".join(buf_text).strip()})
+            buf_text = []; anchor = None
 
-        if buf_bbox is None:
-            buf_bbox = line["bbox"]
-            buf_page = line["page"]
-            buf_ph   = line["page_height"]
-            buf_pw   = line["page_width"]
+        if anchor is None:
+            anchor = {k: line[k] for k in ("page","page_height","page_width","bbox")}
 
         buf_text.append(line["text"])
         combined = " ".join(buf_text)
 
         # Flush on sentence-ending punctuation
         if re.search(r'[.!?]\s*$', combined) and len(combined.split()) >= 6:
-            sentences.append({
-                "text":        combined.strip(),
-                "page":        buf_page,
-                "page_height": buf_ph,
-                "page_width":  buf_pw,
-                "bbox":        buf_bbox,
-            })
-            buf_text = []; buf_bbox = None; buf_page = None
+            sentences.append({**anchor, "text": combined.strip()})
+            buf_text = []; anchor = None
 
-    if buf_text and buf_bbox is not None:
-        sentences.append({
-            "text":        " ".join(buf_text).strip(),
-            "page":        buf_page,
-            "page_height": buf_ph,
-            "page_width":  buf_pw,
-            "bbox":        buf_bbox,
-        })
+    if buf_text and anchor:
+        sentences.append({**anchor, "text": " ".join(buf_text).strip()})
 
     return [s for s in sentences if len(s["text"].split()) >= 5]
 
@@ -125,42 +160,39 @@ def _sentences_to_chunks(
 ) -> list[dict]:
     """
     Group sentences into chunks for embedding.
-    Each chunk stores:
-      - text, page, page_height, page_width, bbox  (first new sentence)
-      - sentence_indices: indices into the sentences list (for lookup after search)
+    Chunks store sentence_indices so citation mapper can look up exact sentences.
+    new_start tracks which sentences are overlap vs new content.
     """
-    chunks    = []
-    buf_sents: list[int] = []   # indices into sentences[]
-    new_start = 0               # index in buf_sents of first non-overlap sentence
+    chunks:    list[dict] = []
+    buf:       list[int]  = []   # sentence indices in buffer
+    new_start: int        = 0    # index in buf of first non-overlap sentence
 
     def flush():
-        if not buf_sents:
+        if not buf:
             return
-        texts = [sentences[i]["text"] for i in buf_sents]
-        text  = " ".join(texts)
+        text = " ".join(sentences[i]["text"] for i in buf)
         if len(text.split()) < 10:
             return
-        anchor_idx = min(new_start, len(buf_sents) - 1)
-        anchor     = sentences[buf_sents[anchor_idx]]
+        idx    = min(new_start, len(buf) - 1)
+        anchor = sentences[buf[idx]]
         chunks.append({
             "text":             text,
             "page":             anchor["page"],
             "page_height":      anchor["page_height"],
             "page_width":       anchor["page_width"],
             "bbox":             anchor["bbox"],
-            "sentence_indices": list(buf_sents),
+            "sentence_indices": list(buf),
         })
 
     for si, sent in enumerate(sentences):
-        buf_sents.append(si)
-        word_count = sum(len(sentences[i]["text"].split()) for i in buf_sents)
-        if word_count >= chunk_words:
+        buf.append(si)
+        if sum(len(sentences[i]["text"].split()) for i in buf) >= chunk_words:
             flush()
-            overlap   = buf_sents[-overlap_sents:]
-            buf_sents = list(overlap)
+            overlap   = buf[-overlap_sents:]
+            buf       = list(overlap)
             new_start = len(overlap)
 
-    if buf_sents:
+    if buf:
         flush()
 
     return chunks
@@ -168,20 +200,11 @@ def _sentences_to_chunks(
 
 # ── Citation mapper ────────────────────────────────────────────────────────
 
-def _normalise(text: str) -> str:
-    """Lowercase, collapse whitespace, remove punctuation for fuzzy matching."""
+def _norm(text: str) -> str:
+    """Lowercase, remove punctuation, collapse whitespace."""
     text = text.lower()
     text = re.sub(r'[^\w\s]', ' ', text)
     return re.sub(r'\s+', ' ', text).strip()
-
-
-def _word_overlap_score(a: str, b: str) -> float:
-    """Jaccard-style word overlap between two normalised strings."""
-    wa = set(a.split())
-    wb = set(b.split())
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / len(wa | wb)
 
 
 def find_best_sentence(
@@ -190,53 +213,53 @@ def find_best_sentence(
     all_sentences: list[dict],
 ) -> dict | None:
     """
-    Given a claim from the LLM answer and a retrieved chunk,
-    find the sentence in that chunk whose BEGINNING best matches
-    the start of the claim.
+    Find the sentence in a chunk whose HEAD best matches the claim head.
 
-    Key fix: we compare the first N words of the claim against the
-    first N words of each sentence — not the full text.
-    This ensures the highlight lands on the START of the passage,
-    not somewhere in the middle where overlapping words happen to cluster.
+    Strategy: compare first 12 words of claim against first 12 words of
+    each candidate sentence. Head-matching is 3× weighted over full overlap.
+    This ensures the highlight lands at the START of the cited passage.
+
+    Rejects sentences that fail body-text geometry (reference list, figures).
     """
-    norm_claim = _normalise(claim)
+    norm_claim  = _norm(claim)
     if not norm_claim:
         return None
 
-    # Use only the first 12 words of the claim as the match target
-    # These most reliably correspond to the opening line of the source passage
     claim_words = norm_claim.split()
-    match_head  = claim_words[:12]
+    head_target = set(claim_words[:12])
+    full_target = set(claim_words)
 
-    best_score = 0.0
-    best_sent  = None
+    best_score: float = 0.0
+    best_sent:  dict | None = None
 
-    indices = chunk_result.get("sentence_indices", [])
-    if not indices:
-        return None
-
-    for si in indices:
+    for si in chunk_result.get("sentence_indices", []):
         if si >= len(all_sentences):
             continue
-        sent      = all_sentences[si]
-        norm_sent = _normalise(sent["text"])
+        sent = all_sentences[si]
+
+        # Skip any sentence that slipped through with bad geometry
+        bbox = sent.get("bbox")
+        if bbox and not _is_body_text(
+            sent["text"], bbox,
+            sent.get("page_height", 841),
+            sent.get("page_width",  595),
+        ):
+            continue
+
+        norm_sent  = _norm(sent["text"])
         sent_words = norm_sent.split()
+        head_sent  = set(sent_words[:12])
+        full_sent  = set(sent_words)
 
-        # Compare claim head against sentence head (first 12 words)
-        sent_head   = sent_words[:12]
-        head_overlap = len(set(match_head) & set(sent_head))
-
-        # Also score full overlap as a secondary signal
-        full_overlap = len(set(claim_words) & set(sent_words))
-
-        # Weighted: head match is 3x more important than full overlap
-        score = (head_overlap * 3) + full_overlap
+        head_overlap = len(head_target & head_sent)
+        full_overlap = len(full_target & full_sent)
+        score        = (head_overlap * 3) + full_overlap
 
         if score > best_score:
             best_score = score
             best_sent  = sent
 
-    # Minimum threshold: at least 2 head words must match
+    # Require at least 2 head words matching (score ≥ 6)
     return best_sent if best_score >= 6 else None
 
 
@@ -284,20 +307,16 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
     if not lines:
         raise ValueError("Could not extract text from PDF.")
 
-    # Build sentence list (with bboxes)
     sentences = _lines_to_sentences(lines)
     if not sentences:
         raise ValueError("Could not extract sentences from PDF.")
 
-    # Build chunks (reference sentence indices)
     chunks = _sentences_to_chunks(sentences)
     if not chunks:
         raise ValueError("PDF text too short to process.")
 
     store = get_store()
-    # Store chunks in Qdrant (for retrieval)
-    # Store full sentences list in payload of a special index point
-    n = store.ingest_phase3(session_id, chunks, sentences, filename)
+    n     = store.ingest_phase3(session_id, chunks, sentences, filename)
 
     if get_settings().database_url:
         try:
@@ -309,82 +328,60 @@ async def ingest_pdf(file_bytes: bytes, filename: str, file_size_mb: float = 0.0
             await insert_event(
                 event_type="pdf_upload",
                 meta={"filename": filename, "chunks": n,
-                      "sentences": len(sentences), "pages": total_pages,
-                      "session_id": session_id},
+                      "sentences": len(sentences),
+                      "pages": total_pages, "session_id": session_id},
             )
         except Exception as e:
             logger.warning(f"DB session persist failed (non-fatal): {e}")
 
     _chat_history_mem[session_id] = []
-    logger.info(
-        f"PDF ingested: {filename} → {n} chunks, "
-        f"{len(sentences)} sentences, {total_pages} pages"
-    )
+    logger.info(f"PDF ingested: {filename} → {n} chunks, {len(sentences)} sentences, {total_pages} pages")
     return session_id
 
 
-# ── Context + citation building ────────────────────────────────────────────
+# ── Citation source builder ────────────────────────────────────────────────
 
-def _split_into_claims(answer: str) -> list[str]:
+def _build_sources(results: list[dict], answer: str, sentences: list[dict]) -> list[dict]:
     """
-    Split LLM answer into individual claims for sentence matching.
-    Splits on sentence boundaries, skipping very short fragments.
-    """
-    raw = re.split(r'(?<=[.!?])\s+', answer)
-    return [c.strip() for c in raw if len(c.strip().split()) >= 6]
+    Map each [N] citation in the answer to an exact sentence bbox.
 
-
-def _build_sources_with_exact_sentences(
-    results:   list[dict],
-    answer:    str,
-    sentences: list[dict],
-) -> list[dict]:
+    1. Split answer into sentences, find which refs each sentence uses.
+    2. For each ref, find the best matching sentence in the retrieved chunk.
+    3. Return structured sources with exact page + bbox for the frontend.
     """
-    Phase 3 citation mapping:
-      For each [N] citation in the answer, find the claim that uses it,
-      then find the best-matching sentence in that chunk.
-      Return per-source exact sentence bbox.
-    """
-    # Parse which ref numbers appear in the answer
-    ref_pattern = re.compile(r'\[(\d+)\]')
+    ref_pat = re.compile(r'\[(\d+)\]')
 
-    # Split answer into sentences and find which refs appear in each
-    answer_sents = re.split(r'(?<=[.!?])\s+', answer)
+    # Map ref number → the answer-sentence that used it (stripped of markers)
     ref_to_claim: dict[int, str] = {}
-    for sent in answer_sents:
-        refs = [int(m) for m in ref_pattern.findall(sent)]
-        # Strip citation markers to get the clean claim text
-        clean = ref_pattern.sub('', sent).strip()
+    for ans_sent in re.split(r'(?<=[.!?])\s+', answer):
+        refs  = [int(m) for m in ref_pat.findall(ans_sent)]
+        clean = ref_pat.sub('', ans_sent).strip()
         for ref in refs:
             if ref not in ref_to_claim:
                 ref_to_claim[ref] = clean
 
     sources = []
     for i, r in enumerate(results, start=1):
-        ref     = i
-        page    = r.get("page", 1)
         text    = r.get("text", "")
         snippet = text[:200].strip() + ("…" if len(text) > 200 else "")
+        page    = r.get("page", 1)
+        bbox    = r.get("bbox")          # chunk anchor (fallback)
 
-        # Try to find exact sentence matching the claim that used this ref
-        exact_bbox     = r.get("bbox")          # fallback = chunk anchor
-        exact_sentence = None
-
-        claim = ref_to_claim.get(ref, "")
+        claim = ref_to_claim.get(i, "")
         if claim and sentences:
             best = find_best_sentence(claim, r, sentences)
             if best:
-                exact_bbox     = best["bbox"]
-                exact_sentence = best["text"]
-                page           = best["page"]   # sentence may be on diff page than chunk anchor
+                bbox    = best["bbox"]
+                snippet = best["text"]
+                page    = best["page"]
 
         sources.append({
-            "ref":         ref,
+            "ref":         i,
             "page":        page,
             "page_height": r.get("page_height"),
             "page_width":  r.get("page_width"),
-            "bbox":        exact_bbox,
-            "snippet":     exact_sentence or snippet,
+            "bbox":        bbox,
+            "snippet":     snippet,
         })
 
     return sources
@@ -411,12 +408,10 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
 
     results.sort(key=lambda r: r["score"], reverse=True)
 
-    # Build LLM context
-    context_parts = []
-    for i, r in enumerate(results, start=1):
-        context_parts.append(f'[{i}] (page {r.get("page",1)})\n"{r.get("text","")}"')
-    context = "\n\n".join(context_parts)
-
+    context = "\n\n".join(
+        f'[{i}] (page {r.get("page",1)})\n"{r.get("text","")}"'
+        for i, r in enumerate(results, start=1)
+    )
     system   = PDF_CHAT_SYSTEM.format(context=context)
     history  = _chat_history_mem[session_id]
     messages = [m.model_dump() for m in history] + [{"role": "user", "content": question}]
@@ -425,11 +420,8 @@ async def chat_with_pdf(session_id: str, question: str) -> dict:
         system=system, messages=messages, max_tokens=1024, task="pdf_chat",
     )
 
-    # Load sentence index for exact citation mapping
     sentences = store.get_sentences(session_id)
-
-    # Map citations to exact sentences
-    sources = _build_sources_with_exact_sentences(results, answer, sentences)
+    sources   = _build_sources(results, answer, sentences)
 
     _chat_history_mem[session_id].append(ChatMessage(role="user",      content=question))
     _chat_history_mem[session_id].append(ChatMessage(role="assistant", content=answer))
@@ -455,7 +447,7 @@ async def extract_properties(session_id: str) -> list[dict]:
     if not await _session_exists(session_id):
         raise ValueError(f"Session '{session_id}' not found.")
 
-    store = get_store()
+    store   = get_store()
     queries = [
         "tensile strength flexural strength Young's modulus mechanical properties",
         "fibre volume fraction void content density weight",
