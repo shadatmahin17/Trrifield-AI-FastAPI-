@@ -115,3 +115,63 @@ async def run_migrations():
     except Exception as e:
         logger.error(f"Migration failed: {e}")
         raise
+
+
+async def run_library_migrations():
+    """Library-specific tables. Called at startup alongside run_migrations()."""
+    LIBRARY_SCHEMA = """
+    -- ── Library papers ──────────────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS library_papers (
+        id            BIGSERIAL    PRIMARY KEY,
+        session_id    TEXT         NOT NULL UNIQUE,
+        filename      TEXT         NOT NULL,
+        title         TEXT,
+        authors       JSONB        NOT NULL DEFAULT '[]',
+        abstract      TEXT,
+        doi           TEXT,
+        journal       TEXT,
+        year          INT,
+        discipline    TEXT         NOT NULL DEFAULT 'general',
+        file_size_mb  FLOAT,
+        r2_key        TEXT,                     -- Cloudflare R2 object key
+        r2_url        TEXT,                     -- public URL
+        chunk_count   INT          NOT NULL DEFAULT 0,
+        uploaded_by   TEXT         NOT NULL DEFAULT 'anonymous',
+        is_public     BOOLEAN      NOT NULL DEFAULT TRUE,
+        view_count    INT          NOT NULL DEFAULT 0,
+        created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        last_accessed TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_lib_created_at  ON library_papers (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_lib_discipline  ON library_papers (discipline);
+    CREATE INDEX IF NOT EXISTS idx_lib_session     ON library_papers (session_id);
+    CREATE INDEX IF NOT EXISTS idx_lib_is_public   ON library_papers (is_public);
+    CREATE INDEX IF NOT EXISTS idx_lib_title       ON library_papers
+        USING gin(to_tsvector('english', COALESCE(title,'')));
+
+    -- ── Extracted column cache ────────────────────────────────────────────────
+    -- Columns extracted on-demand and cached so we don't re-run LLM every time
+    CREATE TABLE IF NOT EXISTS library_columns (
+        id            BIGSERIAL    PRIMARY KEY,
+        paper_id      BIGINT       NOT NULL REFERENCES library_papers(id) ON DELETE CASCADE,
+        column_key    TEXT         NOT NULL,   -- e.g. 'tldr', 'results', 'methods_used'
+        content       TEXT         NOT NULL,
+        extracted_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        UNIQUE (paper_id, column_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_lib_col_paper ON library_columns (paper_id);
+    CREATE INDEX IF NOT EXISTS idx_lib_col_key   ON library_columns (column_key);
+    """
+    try:
+        from db.connection import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(LIBRARY_SCHEMA)
+        import logging
+        logging.getLogger(__name__).info("Library migrations complete")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Library migration failed: {e}")
+        raise

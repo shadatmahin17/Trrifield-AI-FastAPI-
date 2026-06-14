@@ -365,3 +365,153 @@ async def delete_citation(citation_id: int) -> bool:
             "DELETE FROM citations WHERE id=$1", citation_id
         )
         return result == "DELETE 1"
+
+
+# ── Library papers ────────────────────────────────────────────────────────────
+
+async def insert_library_paper(
+    session_id:  str,
+    filename:    str,
+    title:       str | None,
+    authors:     list,
+    abstract:    str | None,
+    doi:         str | None,
+    journal:     str | None,
+    year:        int | None,
+    discipline:  str,
+    file_size_mb:float,
+    r2_key:      str | None,
+    r2_url:      str | None,
+    chunk_count: int,
+    uploaded_by: str = "anonymous",
+) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO library_papers
+                (session_id, filename, title, authors, abstract, doi, journal,
+                 year, discipline, file_size_mb, r2_key, r2_url, chunk_count, uploaded_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            ON CONFLICT (session_id) DO UPDATE
+                SET title=EXCLUDED.title, r2_url=EXCLUDED.r2_url,
+                    last_accessed=NOW()
+            RETURNING id
+            """,
+            session_id, filename, title, json.dumps(authors), abstract,
+            doi, journal, year, discipline, file_size_mb,
+            r2_key, r2_url, chunk_count, uploaded_by,
+        )
+        return row["id"]
+
+
+async def get_library_papers(
+    discipline: str | None = None,
+    search:     str | None = None,
+    limit:      int = 50,
+    offset:     int = 0,
+) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        base = "SELECT * FROM library_papers WHERE is_public=TRUE"
+        args = []
+        if discipline and discipline != "all":
+            args.append(discipline)
+            base += f" AND discipline=${len(args)}"
+        if search:
+            args.append(search)
+            base += f" AND to_tsvector('english', COALESCE(title,'') || ' ' || COALESCE(abstract,'')) @@ plainto_tsquery(${len(args)})"
+        args.extend([limit, offset])
+        base += f" ORDER BY created_at DESC LIMIT ${len(args)-1} OFFSET ${len(args)}"
+        rows = await conn.fetch(base, *args)
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["authors"] = json.loads(d["authors"]) if isinstance(d["authors"], str) else d["authors"]
+            for k in ("created_at","last_accessed"):
+                if d.get(k): d[k] = d[k].isoformat()
+            result.append(d)
+        return result
+
+
+async def get_library_paper(paper_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM library_papers WHERE id=$1", paper_id)
+        if not row: return None
+        d = dict(row)
+        d["authors"] = json.loads(d["authors"]) if isinstance(d["authors"], str) else d["authors"]
+        await conn.execute(
+            "UPDATE library_papers SET view_count=view_count+1, last_accessed=NOW() WHERE id=$1", paper_id
+        )
+        return d
+
+
+async def get_library_paper_by_session(session_id: str) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM library_papers WHERE session_id=$1", session_id)
+        if not row: return None
+        d = dict(row)
+        d["authors"] = json.loads(d["authors"]) if isinstance(d["authors"], str) else d["authors"]
+        return d
+
+
+async def delete_library_paper(paper_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM library_papers WHERE id=$1 RETURNING r2_key, session_id", paper_id
+        )
+        return dict(row) if row else None
+
+
+async def get_library_stats() -> dict:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        total      = await conn.fetchval("SELECT COUNT(*) FROM library_papers WHERE is_public=TRUE")
+        by_disc    = await conn.fetch(
+            "SELECT discipline, COUNT(*) as count FROM library_papers WHERE is_public=TRUE GROUP BY discipline ORDER BY count DESC"
+        )
+        recent     = await conn.fetch(
+            "SELECT id,title,discipline,created_at FROM library_papers WHERE is_public=TRUE ORDER BY created_at DESC LIMIT 5"
+        )
+        return {
+            "total_papers":  total,
+            "by_discipline": {r["discipline"]: r["count"] for r in by_disc},
+            "recent":        [dict(r) for r in recent],
+        }
+
+
+# ── Column extraction cache ───────────────────────────────────────────────────
+
+async def get_column(paper_id: int, column_key: str) -> str | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT content FROM library_columns WHERE paper_id=$1 AND column_key=$2",
+            paper_id, column_key,
+        )
+        return row["content"] if row else None
+
+
+async def set_column(paper_id: int, column_key: str, content: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO library_columns (paper_id, column_key, content)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (paper_id, column_key) DO UPDATE SET content=$3, extracted_at=NOW()
+            """,
+            paper_id, column_key, content,
+        )
+
+
+async def get_all_columns(paper_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT column_key, content FROM library_columns WHERE paper_id=$1", paper_id
+        )
+        return {r["column_key"]: r["content"] for r in rows}
