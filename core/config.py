@@ -12,12 +12,17 @@ class Settings(BaseSettings):
     qdrant_api_key:    str = ""
     qdrant_local_path: str = "./qdrant_db"
 
-    # PostgreSQL — Railway injects DATABASE_URL automatically
+    # PostgreSQL
     database_url:      str = ""
 
-    # API key authentication
-    # Set API_KEY in Railway env vars to enable auth on all /api/* routes.
-    # Leave blank to run without auth (development / trusted network only).
+    # Cloudflare R2
+    r2_account_id:        str = ""
+    r2_access_key_id:     str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name:       str = "trifield-papers"
+    r2_public_url:        str = ""   # e.g. https://pub-xxx.r2.dev
+
+    # API auth
     api_key:           str = ""
 
     # App
