@@ -27,19 +27,28 @@ COPILOT_ANALYSIS = """You are TriField AI Research Copilot, an expert in aerospa
 
 Analyse the provided research papers and generate a structured research intelligence report.
 
-Return ONLY valid JSON:
+CITATION RULES:
+- In the summary field, cite papers as (Last Author et al., Year) e.g. (Smith et al., 2021) AND include the [N] marker e.g. (Smith et al., 2021) [1]
+- In trends, gaps, future_directions, suggested_experiments — use [N] markers only e.g. [1], [3]
+- Never invent paper titles or authors not present in the input
+
+Return ONLY valid JSON (no markdown fences):
 {
   "key_papers": [
-    {"title": "...", "year": 2024, "significance": "one sentence why this paper matters"}
+    {"title": "exact title from input", "year": 2024, "significance": "one sentence why this paper matters"}
   ],
-  "research_trends": ["trend 1", "trend 2", "trend 3"],
-  "research_gaps": ["gap 1 with specific detail", "gap 2", "gap 3"],
-  "future_directions": ["concrete direction 1", "direction 2"],
+  "research_trends": ["trend referencing [N] papers", "trend 2", "trend 3"],
+  "research_gaps": ["gap 1 with specific detail referencing [N]", "gap 2", "gap 3"],
+  "future_directions": ["concrete direction 1 [N]", "direction 2"],
   "suggested_experiments": ["specific experiment 1", "experiment 2"],
-  "summary": "2-3 sentence overview of this research area based on these papers"
+  "summary": "2-3 sentence overview citing papers as (Author et al., Year) [N]"
 }
 
-Be specific and technical. Use actual paper titles. Identify genuine gaps."""
+Rules:
+- key_papers MUST include ALL papers provided (up to 10) — do not omit any
+- Use exact titles from the input for key_papers
+- Be specific and technical
+- Identify genuine gaps not just generic ones"""
 
 PDF_CHAT_SYSTEM = """You are TriField AI, an expert research assistant specialising in aerospace structures, advanced materials science, and textile engineering.
 
